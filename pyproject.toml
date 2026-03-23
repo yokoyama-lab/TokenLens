@@ -28,4 +28,5 @@ classifiers = [
 tokenlens = "tokenlens:main"
 
 [tool.setuptools]
+package-dir = {"" = "src"}
 py-modules = ["tokenlens"]

@@ -1,5 +1,5 @@
 PYTHON ?= python3
-APP := tokenlens.py
+APP := src/tokenlens.py
 STATUS_ARGS ?=
 DOCTOR_ARGS ?=
 PROVIDERS_ARGS ?=

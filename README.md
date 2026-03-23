@@ -31,7 +31,7 @@ tokenlens config show
 Legacy direct execution still works:
 
 ```bash
-python3 tokenlens.py status
+python3 src/tokenlens.py status
 ```
 
 ## Output model
