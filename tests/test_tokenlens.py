@@ -139,6 +139,85 @@ class TokenLensTests(unittest.TestCase):
             "Authentication or permissions are insufficient.",
         )
 
+    def test_codex_window_label_maps_minutes(self):
+        self.assertEqual(tokenlens.codex_window_label(300), "5h")
+        self.assertEqual(tokenlens.codex_window_label(10080), "1w")
+        self.assertEqual(tokenlens.codex_window_label(1440), "1d")
+        self.assertEqual(tokenlens.codex_window_label(0), "window")
+
+    def test_quota_reset_iso_handles_epoch_and_garbage(self):
+        iso = tokenlens.quota_reset_iso(1781408356)
+        self.assertTrue(iso.startswith("2026-"))
+        self.assertIsNone(tokenlens.quota_reset_iso(None))
+        self.assertIsNone(tokenlens.quota_reset_iso("nope"))
+
+    def test_normalize_provider_result_uses_real_codex_quota(self):
+        observed_at = datetime(2026, 6, 14, 2, 0, tzinfo=timezone.utc)
+        cfg = dict(tokenlens.DEFAULT_PROVIDER_SETTINGS["codex"])
+        raw = {
+            "provider": "OpenAI Codex",
+            "source": "session_log",
+            "total_tokens": 317500,
+            "quota": {
+                "primary": {
+                    "used_percent": 60.0,
+                    "window_minutes": 300,
+                    "resets_at": 1781408356,
+                },
+                "primary_label": "5h limit",
+                "secondary": {
+                    "used_percent": 84.0,
+                    "window_minutes": 10080,
+                    "resets_at": 1781795441,
+                },
+                "secondary_label": "Weekly limit",
+            },
+        }
+        item = tokenlens.normalize_provider_result(
+            "codex", raw, cfg, "month", observed_at, observed_at, observed_at,
+        )
+        self.assertEqual(item["unit"], "percent")
+        self.assertEqual(item["used"], 60)
+        self.assertEqual(item["remaining"], 40)
+        self.assertEqual(item["limit"], 100)
+        self.assertEqual(item["window"], "5h")
+        self.assertEqual(item["source_kind"], "reported")
+        self.assertEqual(item["status"], "ok")
+        self.assertIsNotNone(item["reset_at"])
+        self.assertEqual(len(item["secondary_quotas"]), 1)
+        weekly = item["secondary_quotas"][0]
+        self.assertEqual(weekly["label"], "Weekly limit")
+        self.assertEqual(weekly["remaining"], 16)
+        self.assertEqual(weekly["status"], "warn")
+
+    def test_claude_usage_window_normalizes_percent_and_ratio(self):
+        as_percent = tokenlens._claude_usage_window(
+            {"utilization": 60.0, "resets_at": 1781408356}, 300
+        )
+        self.assertEqual(as_percent["used_percent"], 60.0)
+        self.assertEqual(as_percent["window_minutes"], 300)
+        as_ratio = tokenlens._claude_usage_window({"utilization": 0.27}, 10080)
+        self.assertAlmostEqual(as_ratio["used_percent"], 27.0)
+        self.assertIsNone(tokenlens._claude_usage_window({}, 300))
+        self.assertIsNone(tokenlens._claude_usage_window(None, 300))
+
+    def test_quota_reset_iso_accepts_iso_strings(self):
+        iso = tokenlens.quota_reset_iso("2026-06-19T23:59:00Z")
+        self.assertTrue(iso.startswith("2026-06-"))
+
+    def test_normalize_details_keeps_quota_out_of_unexpected(self):
+        details = tokenlens.normalize_details(
+            {
+                "provider": "OpenAI Codex",
+                "source": "session_log",
+                "sessions": 5,
+                "quota": {"primary": {}},
+            }
+        )
+        self.assertEqual(details["sessions"], 5)
+        self.assertNotIn("unexpected_fields_redacted", details)
+        self.assertNotIn("quota", details)
+
     def test_safe_glob_files_rejects_symlinks(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -9,6 +9,8 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -53,9 +55,16 @@ def fmt_tokens(value: int | None) -> str:
 def fmt_value(value: int | None, unit: str) -> str:
     if value is None:
         return "unknown"
+    if unit == "percent":
+        return f"{value}%"
     if unit == "requests":
         return f"{value:,}"
     return fmt_tokens(value)
+
+
+def unit_suffix(unit: str) -> str:
+    # percent values are already rendered with a "%" sign by fmt_value
+    return "" if unit == "percent" else f" {unit}"
 
 
 def fmt_observed_at(value: str) -> str:
@@ -155,6 +164,7 @@ DEFAULT_PROVIDER_SETTINGS = {
         "warn_threshold": 0.20,
         "critical_threshold": 0.10,
         "enabled": True,
+        "use_api": False,
     },
     "codex": {
         "limit": 0,
@@ -200,10 +210,10 @@ PROVIDER_INFO = {
     },
     "codex": {
         "name": "OpenAI Codex",
-        "support": "estimated",
-        "data_source": "Local Codex SQLite state DB",
-        "required_auth": "No additional auth if local DB exists",
-        "limitations": "Relies on the local Codex state schema; quota resets are configured manually.",
+        "support": "reported",
+        "data_source": "Rate limits reported in local Codex session logs (with SQLite state DB for token stats)",
+        "required_auth": "No additional auth if local session logs exist",
+        "limitations": "Quota percentages come from the most recent Codex session; run Codex once if logs are stale.",
         "manual_check": {
             "label": "OpenAI usage dashboard",
             "url": "https://platform.openai.com/usage",
@@ -238,6 +248,7 @@ PROVIDER_INFO = {
 
 SOURCE_META = {
     "official_api": ("official", "high"),
+    "session_log": ("reported", "high"),
     "local_logs": ("estimated", "medium"),
     "local_db": ("estimated", "medium"),
     "unavailable": ("unavailable", "low"),
@@ -310,6 +321,7 @@ def normalize_provider_settings(raw_settings: dict, defaults: dict) -> dict:
         "warn_threshold",
         "critical_threshold",
         "enabled",
+        "use_api",
     ):
         if key in raw_settings:
             merged[key] = raw_settings[key]
@@ -346,6 +358,8 @@ def normalize_provider_settings(raw_settings: dict, defaults: dict) -> dict:
         )
 
     merged["enabled"] = bool(merged.get("enabled", defaults["enabled"]))
+    if "use_api" in defaults:
+        merged["use_api"] = bool(merged.get("use_api", defaults["use_api"]))
     merged["window"] = str(merged.get("window", defaults["window"]))
     merged["label"] = str(merged.get("label", defaults["label"]))
     merged["weekly_window"] = str(merged.get("weekly_window", defaults.get("weekly_window", "7d")))
@@ -499,6 +513,117 @@ def build_secondary_quota(
 
 # ── Provider collection ────────────────────────────────────────────
 
+CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+
+def read_claude_oauth_token() -> dict | None:
+    """Read the Claude Code OAuth access token from the local credential store.
+
+    Returns ``{"token": str, "expires_at": int|None}`` or ``None`` when no
+    usable token is present. TokenLens only reads the token to authenticate the
+    user's own usage lookup; it is never logged or persisted.
+    """
+    path = Path.home() / ".claude" / ".credentials.json"
+    if not path.exists() or path.is_symlink():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    oauth = data.get("claudeAiOauth") or {}
+    token = oauth.get("accessToken")
+    if not token:
+        return None
+    return {"token": token, "expires_at": oauth.get("expiresAt")}
+
+
+def _claude_usage_window(obj, window_minutes: int) -> dict | None:
+    if not isinstance(obj, dict):
+        return None
+    util = obj.get("utilization")
+    if util is None:
+        return None
+    try:
+        util = float(util)
+    except (TypeError, ValueError):
+        return None
+    # The endpoint reports utilization as a percentage (0-100); tolerate a 0-1 ratio too.
+    used_percent = util * 100 if util <= 1 else util
+    return {
+        "used_percent": used_percent,
+        "window_minutes": window_minutes,
+        "resets_at": obj.get("resets_at"),
+    }
+
+
+def collect_claude_api() -> dict | None:
+    """Fetch real Claude quota utilization from the official OAuth usage endpoint.
+
+    Returns a raw result dict with a percent-based ``quota`` block, an error
+    dict, or ``None`` if no credentials are available (so the caller can fall
+    back to local-log estimation).
+    """
+    creds = read_claude_oauth_token()
+    if creds is None:
+        return None
+
+    expires_at = creds.get("expires_at")
+    if isinstance(expires_at, (int, float)) and expires_at > 0:
+        # expiresAt is epoch milliseconds in the Claude Code credential store.
+        if datetime.now(timezone.utc).timestamp() * 1000 > expires_at:
+            return {"error": "Claude OAuth token expired; run `claude` to refresh it."}
+
+    # CLAUDE_USAGE_URL is a fixed https constant (never user-controlled); guard the
+    # scheme anyway so urllib can never be redirected to file:// or other schemes.
+    if not CLAUDE_USAGE_URL.startswith("https://"):
+        return {"error": "Claude usage endpoint must be https."}
+
+    request = urllib.request.Request(
+        CLAUDE_USAGE_URL,
+        headers={
+            "Authorization": f"Bearer {creds['token']}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "anthropic-version": "2023-06-01",
+            "Accept": "application/json",
+            "User-Agent": "TokenLens",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return {"error": f"Claude usage API error: {classify_cli_error(str(exc.code))}"}
+    except (urllib.error.URLError, TimeoutError) as exc:
+        return {"error": f"Claude usage API unreachable: {classify_cli_error(str(exc.reason))}"}
+    except (json.JSONDecodeError, ValueError):
+        return {"error": "Claude usage API returned an unexpected response."}
+
+    primary = _claude_usage_window(payload.get("five_hour"), 300)
+    if primary is None:
+        return {"error": "Claude usage API response did not include session usage."}
+
+    secondaries = []
+    weekly = _claude_usage_window(payload.get("seven_day"), 10080)
+    if weekly:
+        secondaries.append({"key": "weekly", "label": "Weekly (all models)", "data": weekly})
+    weekly_sonnet = _claude_usage_window(payload.get("seven_day_sonnet"), 10080)
+    if weekly_sonnet:
+        secondaries.append({"key": "weekly_sonnet", "label": "Weekly (Sonnet)", "data": weekly_sonnet})
+    weekly_opus = _claude_usage_window(payload.get("seven_day_opus"), 10080)
+    if weekly_opus:
+        secondaries.append({"key": "weekly_opus", "label": "Weekly (Opus)", "data": weekly_opus})
+
+    return {
+        "provider": PROVIDER_INFO["claude"]["name"],
+        "source": "official_api",
+        "quota": {
+            "primary": primary,
+            "primary_label": "Session (5h)",
+            "secondaries": secondaries,
+        },
+    }
+
+
 def collect_claude(start: datetime, end: datetime) -> dict:
     claude_dir = Path.home() / ".claude" / "projects"
     if not claude_dir.exists():
@@ -589,6 +714,56 @@ def find_codex_db() -> Path | None:
     return candidates[-1] if candidates else None
 
 
+def codex_window_label(minutes: int) -> str:
+    if not minutes:
+        return "window"
+    if minutes % 10080 == 0:
+        return f"{minutes // 10080}w"
+    if minutes % 1440 == 0:
+        return f"{minutes // 1440}d"
+    if minutes % 60 == 0:
+        return f"{minutes // 60}h"
+    return f"{minutes}m"
+
+
+def read_codex_rate_limits() -> dict | None:
+    """Return the most recent rate-limit snapshot Codex recorded in its session logs.
+
+    Codex writes a ``token_count`` event with a ``rate_limits`` block to each
+    session rollout. We scan the newest rollouts and return the latest populated
+    primary/secondary windows (used_percent + reset epoch) — the same numbers the
+    Codex CLI shows on startup.
+    """
+    sessions_root = Path.home() / ".codex" / "sessions"
+    files = safe_glob_files(sessions_root, "**/rollout-*.jsonl")
+    if not files:
+        return None
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+    for path in files[:40]:
+        try:
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            continue
+        for line in reversed(lines):
+            if '"rate_limits"' not in line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            rate_limits = (event.get("payload") or {}).get("rate_limits") or {}
+            primary = rate_limits.get("primary")
+            secondary = rate_limits.get("secondary")
+            if primary or secondary:
+                return {
+                    "primary": primary,
+                    "secondary": secondary,
+                    "observed": event.get("timestamp"),
+                }
+    return None
+
+
 def collect_codex(start: datetime, end: datetime) -> dict:
     db_path = find_codex_db()
     if db_path is None:
@@ -620,7 +795,7 @@ def collect_codex(start: datetime, end: datetime) -> dict:
         all_time_sessions, all_time_tokens = cursor.fetchone()
         conn.close()
 
-        return {
+        result = {
             "provider": PROVIDER_INFO["codex"]["name"],
             "source": "local_db",
             "total_tokens": window_tokens,
@@ -629,6 +804,18 @@ def collect_codex(start: datetime, end: datetime) -> dict:
             "all_time_tokens": all_time_tokens,
             "all_time_sessions": all_time_sessions,
         }
+
+        rate_limits = read_codex_rate_limits()
+        if rate_limits and (rate_limits.get("primary") or rate_limits.get("secondary")):
+            result["source"] = "session_log"
+            result["quota"] = {
+                "primary": rate_limits.get("primary"),
+                "primary_label": "5h limit",
+                "secondary": rate_limits.get("secondary"),
+                "secondary_label": "Weekly limit",
+            }
+
+        return result
     except sqlite3.Error as exc:
         return {"error": f"Codex DB error: {exc}"}
 
@@ -857,11 +1044,53 @@ def normalize_details(raw: dict) -> dict:
         if key in allowed_keys:
             details[key] = value
     unexpected = sorted(
-        key for key in raw.keys() if key not in allowed_keys | redacted_keys | {"provider", "source"}
+        key for key in raw.keys() if key not in allowed_keys | redacted_keys | {"provider", "source", "quota"}
     )
     if unexpected:
         details["unexpected_fields_redacted"] = unexpected
     return details
+
+
+def quota_reset_iso(resets_at) -> str | None:
+    if resets_at is None:
+        return None
+    # Unix epoch (int, float, or numeric string)
+    try:
+        epoch = int(float(resets_at))
+        return datetime.fromtimestamp(epoch, LOCAL_TZ).isoformat()
+    except (TypeError, ValueError):
+        pass
+    # ISO-8601 timestamp string
+    try:
+        dt = datetime.fromisoformat(str(resets_at).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(LOCAL_TZ).isoformat()
+    except ValueError:
+        return None
+
+
+def build_percent_quota(key: str, label: str, window_data: dict, source_kind: str, provider_cfg: dict) -> dict:
+    used = round(window_data.get("used_percent") or 0)
+    limit = 100
+    remaining = max(limit - used, 0)
+    window = codex_window_label(window_data.get("window_minutes") or 0)
+    reset_at = quota_reset_iso(window_data.get("resets_at"))
+    return {
+        "key": key,
+        "label": label,
+        "window": window,
+        "unit": "percent",
+        "used": used,
+        "remaining": remaining,
+        "limit": limit,
+        "status": compute_status(source_kind, used, limit, provider_cfg),
+        "reset_kind": "fixed" if reset_at else "unknown",
+        "reset_at": reset_at,
+        "reset_note": (
+            f"Resets at the end of the rolling {window} window." if reset_at else None
+        ),
+    }
 
 
 def normalize_provider_result(
@@ -876,6 +1105,57 @@ def normalize_provider_result(
 ) -> dict:
     info = PROVIDER_INFO[provider_key]
     source_kind, confidence = source_kind_and_confidence(raw)
+
+    quota = raw.get("quota")
+    if quota and quota.get("primary"):
+        primary = build_percent_quota(
+            "primary", quota.get("primary_label", "Primary"),
+            quota["primary"], source_kind, provider_cfg,
+        )
+        extra_quotas = list(secondary_quotas or [])
+        if quota.get("secondary"):
+            extra_quotas.append(
+                build_percent_quota(
+                    "secondary", quota.get("secondary_label", "Secondary"),
+                    quota["secondary"], source_kind, provider_cfg,
+                )
+            )
+        for idx, sec in enumerate(quota.get("secondaries") or []):
+            if not sec.get("data"):
+                continue
+            extra_quotas.append(
+                build_percent_quota(
+                    sec.get("key", f"secondary_{idx}"),
+                    sec.get("label", "Secondary"),
+                    sec["data"], source_kind, provider_cfg,
+                )
+            )
+        return {
+            "provider": provider_key,
+            "name": info["name"],
+            "status": primary["status"],
+            "source_kind": source_kind,
+            "confidence": confidence,
+            "window": primary["window"],
+            "window_start": start.isoformat(),
+            "window_end": end.isoformat(),
+            "observed_at": observed_at.isoformat(),
+            "unit": primary["unit"],
+            "used": primary["used"],
+            "remaining": primary["remaining"],
+            "limit": primary["limit"],
+            "label": provider_cfg.get("label") or None,
+            "enabled": provider_cfg.get("enabled", True),
+            "warn_threshold": provider_cfg["warn_threshold"],
+            "critical_threshold": provider_cfg["critical_threshold"],
+            "reset_kind": primary["reset_kind"],
+            "reset_at": primary["reset_at"],
+            "reset_note": primary["reset_note"],
+            "secondary_quotas": extra_quotas,
+            "manual_check": info["manual_check"],
+            "details": normalize_details(raw),
+        }
+
     unit = provider_cfg["limit_type"]
     limit = provider_cfg["limit"] if provider_cfg["limit"] > 0 else None
     used = raw_used_value(raw, unit)
@@ -952,10 +1232,18 @@ def collect_status_results(config: dict, requested: list[str], explicit_window: 
         provider_cfg = config["providers"][provider]
         window = explicit_window or provider_cfg["window"]
         start, end = parse_window(window)
-        raw = COLLECTORS[provider](start, end)
+
+        raw = None
+        if provider == "claude" and provider_cfg.get("use_api"):
+            api_raw = collect_claude_api()
+            if api_raw is not None and "quota" in api_raw:
+                raw = api_raw
+        if raw is None:
+            raw = COLLECTORS[provider](start, end)
+
         secondary_quotas = []
 
-        if provider == "claude" and provider_cfg.get("weekly_limit", 0) > 0:
+        if provider == "claude" and not raw.get("quota") and provider_cfg.get("weekly_limit", 0) > 0:
             weekly_window = provider_cfg.get("weekly_window", "7d")
             weekly_start, weekly_end = parse_window(weekly_window)
             weekly_raw = COLLECTORS[provider](weekly_start, weekly_end)
@@ -1021,17 +1309,17 @@ def display_status_provider(item: dict) -> None:
         print(f"    {make_gauge(used, limit)}")
         print(
             f"    {'Used:':<16} {c(fmt_value(used, item['unit']), BOLD, WHITE)}"
-            f"  /  {fmt_value(limit, item['unit'])} {item['unit']}"
+            f"  /  {fmt_value(limit, item['unit'])}{unit_suffix(item['unit'])}"
         )
         print(
             f"    {'Remaining:':<16} "
-            f"{c(fmt_value(item['remaining'], item['unit']), BOLD, status_colour(item['status']))} "
-            f"{item['unit']}"
+            f"{c(fmt_value(item['remaining'], item['unit']), BOLD, status_colour(item['status']))}"
+            f"{unit_suffix(item['unit'])}"
         )
     elif used is not None:
         print(
             f"    {'Used:':<16} "
-            f"{c(fmt_value(used, item['unit']), BOLD, WHITE)} {item['unit']}"
+            f"{c(fmt_value(used, item['unit']), BOLD, WHITE)}{unit_suffix(item['unit'])}"
         )
         print(f"    {c('Configure a limit to enable remaining quota warnings.', DIM)}")
     else:
@@ -1071,7 +1359,7 @@ def display_status_provider(item: dict) -> None:
         print(
             f"    {c(safe_text(quota_label), DIM):<16} "
             f"{fmt_value(quota['remaining'], quota['unit'])} / "
-            f"{fmt_value(quota['limit'], quota['unit'])} {quota['unit']} left"
+            f"{fmt_value(quota['limit'], quota['unit'])}{unit_suffix(quota['unit'])} left"
         )
         if quota.get("reset_at"):
             print(f"    {c('  resets at:', DIM):<16} {fmt_short_datetime(quota['reset_at'])}")
@@ -1109,7 +1397,7 @@ def display_status_summary(results: list[dict], show_bar: bool) -> None:
             print(
                 f"    {item['name']:<16} "
                 f"{make_gauge(item['used'], item['limit'], width=24)}  "
-                f"{fmt_value(item['remaining'], item['unit'])} {item['unit']} left"
+                f"{fmt_value(item['remaining'], item['unit'])}{unit_suffix(item['unit'])} left"
             )
     print()
 
@@ -1461,11 +1749,15 @@ def run_config_command(args: argparse.Namespace, config: dict) -> int:
                 raise ValueError("critical_threshold must be less than or equal to warn_threshold")
         elif field == "enabled":
             provider_cfg["enabled"] = parse_bool(value)
+        elif field == "use_api":
+            if provider != "claude":
+                raise ValueError("use_api is only supported for the claude provider")
+            provider_cfg["use_api"] = parse_bool(value)
         else:
             raise ValueError(
                 "unknown field (use: limit, limit_type, window, label, "
                 "weekly_limit, weekly_window, weekly_label, "
-                "warn_threshold, critical_threshold, enabled)"
+                "warn_threshold, critical_threshold, enabled, use_api)"
             )
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)

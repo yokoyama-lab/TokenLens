@@ -84,4 +84,6 @@ tokenlens config set <provider>.label "Main quota"
 
 - TokenLens uses local-only inspection and does not upload usage data.
 - Some providers are estimated from local state rather than an official quota endpoint.
+- Codex reports real quota percentages: TokenLens reads the `rate_limits` block (5h + weekly windows, with reset times) that the Codex CLI records in its local session logs — the same numbers Codex shows on startup. Run Codex at least once so a recent snapshot exists.
+- Claude can report real quota percentages too, opt-in. Enable it with `tokenlens config set claude.use_api true`. TokenLens then reads the local Claude Code OAuth token (`~/.claude/.credentials.json`) and calls the official `/api/oauth/usage` endpoint — the same data behind Claude Code's `/usage` (session 5h + weekly all-models + weekly Sonnet/Opus). The token is only used to authenticate your own lookup; it is never logged or stored. With `use_api` off (the default), Claude usage stays a local-log estimate and no network call is made.
 - Availability depends on what local data or authenticated tools are present on the machine.
