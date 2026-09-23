@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # src/tokenlens.py uses a nested same-quote f-string (PEP 701),
+        # which is a SyntaxError on Python 3.11, so the matrix starts at 3.12.
+        python-version: ["3.12", "3.13"]
+    env:
+      # tests/test_tokenlens.py::test_fmt_observed_at_shortens_terminal_display
+      # asserts local-time output for a +09:00 timestamp, so the suite is
+      # run in the maintainers' timezone.
+      TZ: Asia/Tokyo
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # The CLI is pure standard-library Python and the tests add src/ to
+      # sys.path themselves, so there is nothing to install.
+      - name: Run tests
+        run: make test PYTHON=python
